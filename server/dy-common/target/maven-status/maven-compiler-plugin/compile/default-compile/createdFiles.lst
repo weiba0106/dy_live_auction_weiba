@@ -1,0 +1,10 @@
+com\dy\liveauction\common\enums\UserRole.class
+com\dy\liveauction\common\result\PageResult.class
+com\dy\liveauction\common\enums\NotificationType.class
+com\dy\liveauction\common\exception\ErrorCode.class
+com\dy\liveauction\common\result\Result.class
+com\dy\liveauction\common\enums\LiveRoomStatus.class
+com\dy\liveauction\common\enums\AuctionStatus.class
+com\dy\liveauction\common\base\BaseEntity.class
+com\dy\liveauction\common\enums\OrderStatus.class
+com\dy\liveauction\common\exception\BizException.class

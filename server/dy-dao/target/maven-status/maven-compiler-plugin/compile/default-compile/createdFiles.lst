@@ -1,0 +1,14 @@
+com\dy\liveauction\dao\mapper\UserMapper.class
+com\dy\liveauction\dao\mapper\BidMapper.class
+com\dy\liveauction\dao\entity\LiveRoom.class
+com\dy\liveauction\dao\entity\User.class
+com\dy\liveauction\dao\config\MybatisPlusConfig$1.class
+com\dy\liveauction\dao\mapper\OrderMapper.class
+com\dy\liveauction\dao\mapper\LiveRoomMapper.class
+com\dy\liveauction\dao\entity\AuctionItem.class
+com\dy\liveauction\dao\entity\Bid.class
+com\dy\liveauction\dao\entity\Order.class
+com\dy\liveauction\dao\mapper\AuctionItemMapper.class
+com\dy\liveauction\dao\mapper\NotificationMapper.class
+com\dy\liveauction\dao\config\MybatisPlusConfig.class
+com\dy\liveauction\dao\entity\Notification.class

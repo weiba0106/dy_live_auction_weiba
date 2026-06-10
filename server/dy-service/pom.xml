@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>com.dy.liveauction</groupId>
+        <artifactId>dy-live-auction</artifactId>
+        <version>1.0.0-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>dy-service</artifactId>
+    <name>dy-service</name>
+    <description>业务层：竞拍逻辑、状态机、出价校验、订单、WebSocket管理</description>
+
+    <dependencies>
+        <!-- 内部依赖 -->
+        <dependency>
+            <groupId>com.dy.liveauction</groupId>
+            <artifactId>dy-dao</artifactId>
+        </dependency>
+
+        <!-- Spring 上下文（@Service、@EventListener 等） -->
+        <dependency>
+            <groupId>org.springframework</groupId>
+            <artifactId>spring-context</artifactId>
+        </dependency>
+
+        <!-- JWT API（生成和解析 token） -->
+        <dependency>
+            <groupId>io.jsonwebtoken</groupId>
+            <artifactId>jjwt-api</artifactId>
+        </dependency>
+
+        <!-- Spring Messaging（SimpMessagingTemplate） -->
+        <dependency>
+            <groupId>org.springframework</groupId>
+            <artifactId>spring-messaging</artifactId>
+        </dependency>
+
+        <!-- Redisson（分布式锁 + 缓存 + 排行榜） -->
+        <dependency>
+            <groupId>org.redisson</groupId>
+            <artifactId>redisson</artifactId>
+            <version>${redisson.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>io.jsonwebtoken</groupId>
+            <artifactId>jjwt-impl</artifactId>
+            <scope>runtime</scope>
+        </dependency>
+        <dependency>
+            <groupId>io.jsonwebtoken</groupId>
+            <artifactId>jjwt-jackson</artifactId>
+            <scope>runtime</scope>
+        </dependency>
+    </dependencies>
+
+</project>

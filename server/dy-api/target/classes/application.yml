@@ -1,0 +1,56 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: dy-live-auction
+
+  # MySQL 数据源
+  datasource:
+    url: jdbc:mysql://127.0.0.1:3306/dy_live_auction?useUnicode=true&characterEncoding=UTF-8&serverTimezone=Asia/Shanghai&useSSL=false&allowPublicKeyRetrieval=true
+    username: root
+    password: 123456
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    hikari:
+      pool-name: AuctionHikariCP
+      minimum-idle: 10
+      maximum-pool-size: 50
+      idle-timeout: 180000
+      max-lifetime: 1800000
+      connection-timeout: 30000
+      connection-test-query: SELECT 1
+
+  # Jackson 日期格式
+  jackson:
+    date-format: yyyy-MM-dd HH:mm:ss
+    time-zone: Asia/Shanghai
+
+# Redis（自定义前缀 redis.sdk.config，不在 spring 下）
+redis:
+  sdk:
+    config:
+      host: 124.222.245.166
+      port: 6379
+      pool-size: 10
+      min-idle-size: 5
+      idle-timeout: 30000
+      connect-timeout: 5000
+      retry-attempts: 3
+      retry-interval: 1000
+      ping-interval: 60000
+      keep-alive: true
+      password: 123456
+
+# MyBatis-Plus
+mybatis-plus:
+  configuration:
+    log-impl: org.apache.ibatis.logging.stdout.StdOutImpl
+    map-underscore-to-camel-case: true
+  global-config:
+    db-config:
+      id-type: auto
+
+# Knife4j
+springdoc:
+  swagger-ui:
+    path: /swagger-ui.html

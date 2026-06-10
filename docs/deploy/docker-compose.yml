@@ -1,0 +1,94 @@
+version: "3.8"
+
+services:
+  # ========== 基础设施 ==========
+  mysql:
+    image: mysql:8.0
+    container_name: dy-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: 123456
+      MYSQL_DATABASE: dy_live_auction
+      TZ: Asia/Shanghai
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./docs/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - dy-net
+
+  redis:
+    image: redis:7-alpine
+    container_name: dy-redis
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    networks:
+      - dy-net
+
+  # ========== 后端 ==========
+  backend:
+    build:
+      context: ../../server
+      dockerfile: ../../server/Dockerfile
+    container_name: dy-backend
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:mysql://mysql:3306/dy_live_auction?useUnicode=true&characterEncoding=UTF-8&serverTimezone=Asia/Shanghai&useSSL=false&allowPublicKeyRetrieval=true
+      SPRING_DATASOURCE_USERNAME: root
+      SPRING_DATASOURCE_PASSWORD: 123456
+      REDIS_SDK_CONFIG_HOST: redis
+      REDIS_SDK_CONFIG_PORT: 6379
+      REDIS_SDK_CONFIG_PASSWORD: ""
+      TZ: Asia/Shanghai
+    ports:
+      - "8080:8080"
+    networks:
+      - dy-net
+
+  # ========== 前端 — 主播管理后台 ==========
+  frontend-admin:
+    build:
+      context: ../..
+      dockerfile: ../../Dockerfile.admin
+    container_name: dy-admin
+    depends_on:
+      - backend
+    ports:
+      - "3000:80"
+    networks:
+      - dy-net
+
+  # ========== 前端 — 用户端 ==========
+  frontend-user:
+    build:
+      context: ../..
+      dockerfile: ../../Dockerfile.user
+    container_name: dy-user
+    depends_on:
+      - backend
+    ports:
+      - "4000:80"
+    networks:
+      - dy-net
+
+volumes:
+  mysql_data:
+
+networks:
+  dy-net:
+    driver: bridge
