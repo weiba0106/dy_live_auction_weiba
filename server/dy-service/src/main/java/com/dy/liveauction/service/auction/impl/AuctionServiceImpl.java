@@ -26,15 +26,18 @@ import com.dy.liveauction.service.event.AuctionStatusChangeEvent;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.redisson.api.RLock;
-import org.redisson.api.RScoredSortedSet;
 import org.redisson.api.RedissonClient;
 import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 import java.math.BigDecimal;
 import java.time.Duration;
+import java.time.LocalDateTime;
 import java.util.List;
+import java.util.Objects;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
@@ -75,8 +78,7 @@ public class AuctionServiceImpl implements AuctionService {
         item.setCurrentPrice(item.getStartPrice());
         item.setStatus(1);
         auctionItemMapper.insert(item);
-        cacheService.invalidate("cache:room:" + req.getRoomId() + ":auctions");
-        cacheService.invalidate("cache:rooms:live");
+        runAfterCommit(() -> invalidateAuctionCaches(item));
         return item;
     }
 
@@ -94,8 +96,7 @@ public class AuctionServiceImpl implements AuctionService {
         item.setDurationMinutes(req.getDurationMinutes());
         item.setDelaySeconds(req.getDelaySeconds() != null ? req.getDelaySeconds() : item.getDelaySeconds());
         auctionItemMapper.updateById(item);
-        cacheService.invalidate("cache:room:" + item.getRoomId() + ":auctions");
-        cacheService.invalidate("cache:rooms:live");
+        runAfterCommit(() -> invalidateAuctionCaches(item));
     }
 
     @Override
@@ -111,18 +112,18 @@ public class AuctionServiceImpl implements AuctionService {
                 (Class<List<AuctionDetailVO>>) (Class<?>) List.class,
                 Duration.ofSeconds(2),
                 () -> auctionItemMapper.selectList(
-                        new LambdaQueryWrapper<AuctionItem>()
-                                .eq(AuctionItem::getRoomId, roomId)
-                                .orderByDesc(AuctionItem::getId))
+                                new LambdaQueryWrapper<AuctionItem>()
+                                        .eq(AuctionItem::getRoomId, roomId)
+                                        .orderByDesc(AuctionItem::getId))
                         .stream().map(AuctionDetailVO::from).collect(Collectors.toList()));
     }
 
     @Override
     public IPage<AuctionDetailVO> pageMyAuctions(Long merchantId, int page, int size) {
         return auctionItemMapper.selectPage(new Page<>(page, size),
-                new LambdaQueryWrapper<AuctionItem>()
-                        .eq(AuctionItem::getMerchantId, merchantId)
-                        .orderByDesc(AuctionItem::getId))
+                        new LambdaQueryWrapper<AuctionItem>()
+                                .eq(AuctionItem::getMerchantId, merchantId)
+                                .orderByDesc(AuctionItem::getId))
                 .convert(AuctionDetailVO::from);
     }
 
@@ -130,108 +131,126 @@ public class AuctionServiceImpl implements AuctionService {
     @Transactional
     public void startAuction(Long itemId) {
         AuctionItem item = mustGet(itemId);
+        int oldStatus = item.getStatus();
         stateMachine.start(item);
-        auctionItemMapper.updateById(item);
-        cacheService.invalidate("cache:item:" + itemId);
-        cacheService.invalidate("cache:room:" + item.getRoomId() + ":auctions");
-        cacheService.invalidate("cache:rooms:live");
-        eventPublisher.publishEvent(new AuctionStatusChangeEvent(this, item.getId(), 1, item.getStatus(), null));
-        broadcastAuctionEventSafely(item, "STARTED");
+        int updated = auctionItemMapper.startIfPending(
+                item.getId(), item.getStartTime(), item.getPlannedEndTime(), item.getActualEndTime());
+        if (updated != 1) throw new BizException(409, "竞拍状态已变化，请刷新后重试");
+
+        runAfterCommit(() -> {
+            invalidateAuctionCaches(item);
+            eventPublisher.publishEvent(new AuctionStatusChangeEvent(this, item.getId(), oldStatus, item.getStatus(), null));
+            broadcastAuctionEventSafely(item, "STARTED");
+        });
     }
 
     @Override
     @Transactional
     public void cancelAuction(Long itemId, String reason) {
-        AuctionItem item = mustGet(itemId);
-        int oldStatus = item.getStatus();
-        stateMachine.cancel(item, reason);
-        auctionItemMapper.updateById(item);
-        cacheService.invalidate("cache:item:" + item.getId());
-        cacheService.invalidate("cache:room:" + item.getRoomId() + ":auctions");
-        cacheService.invalidate("cache:rooms:live");
-        eventPublisher.publishEvent(new AuctionStatusChangeEvent(this, item.getId(), oldStatus, item.getStatus(), null));
-        broadcastAuctionEventSafely(item, "CANCELLED");
+        RLock lock = lockAuctionItem(itemId);
+        try {
+            AuctionItem item = mustGet(itemId);
+            int oldStatus = item.getStatus();
+            stateMachine.cancel(item, reason);
+
+            int updated = auctionItemMapper.cancelIfOpen(item.getId(), reason);
+            if (updated != 1) throw new BizException(409, "竞拍状态已变化，请刷新后重试");
+
+            if (oldStatus == 2 && item.getCurrentBidderId() != null) {
+                releaseFrozenFunds(item.getCurrentBidderId(), item.getCurrentPrice());
+            }
+
+            runAfterCommit(() -> {
+                invalidateAuctionCaches(item);
+                eventPublisher.publishEvent(new AuctionStatusChangeEvent(this, item.getId(), oldStatus, 5, null));
+                broadcastAuctionEventSafely(item, "CANCELLED");
+            });
+        } finally {
+            unlockSafely(lock);
+        }
     }
 
     @Override
     @Transactional
     public void endAuction(Long itemId) {
-        doEndAuction(mustGet(itemId));
+        RLock lock = lockAuctionItem(itemId);
+        try {
+            doEndAuction(mustGet(itemId));
+        } finally {
+            unlockSafely(lock);
+        }
     }
 
-    /** 结束竞拍（不重查库，直接用传入的 item 对象，避免 MyBatis 一级缓存回写旧数据） */
-    private void doEndAuction(AuctionItem item) {
+    private boolean doEndAuction(AuctionItem item) {
         int oldStatus = item.getStatus();
         stateMachine.end(item);
-        auctionItemMapper.updateById(item);
-        cacheService.invalidate("cache:item:" + item.getId());
-        cacheService.invalidate("cache:room:" + item.getRoomId() + ":auctions");
-        cacheService.invalidate("cache:rooms:live");
-        eventPublisher.publishEvent(new AuctionStatusChangeEvent(this, item.getId(), oldStatus, item.getStatus(), item.getWinnerId()));
-        broadcastAuctionEventSafely(item, item.getStatus() == 4 ? "SOLD" : "ENDED");
+        int updated = auctionItemMapper.finishIfActive(item.getId(), item.getStatus(), item.getWinnerId());
+        if (updated != 1) {
+            log.info("竞拍结束跳过，状态已变化: itemId={}", item.getId());
+            return false;
+        }
+
+        runAfterCommit(() -> {
+            invalidateAuctionCaches(item);
+            eventPublisher.publishEvent(new AuctionStatusChangeEvent(
+                    this, item.getId(), oldStatus, item.getStatus(), item.getWinnerId()));
+            broadcastAuctionEventSafely(item, item.getStatus() == 4 ? "SOLD" : "ENDED");
+        });
+        return true;
     }
 
     @Override
     @Transactional
     public AuctionItem placeBid(Long itemId, Long userId, BigDecimal amount) {
-        AuctionItem item = mustGet(itemId);
-
-        validateAuctionActive(item);
-        validateIncrement(item.getCurrentPrice(), amount, item.getIncrementAmount());
-        validateMaxPrice(amount, item.getMaxPrice());
-        validateBalance(userId, amount);
-
-        // -- 分布式锁 --
-        RLock lock = redissonClient.getLock("lock:bid:" + itemId + ":" + userId);
-        boolean locked;
-        try { locked = lock.tryLock(0, 3, TimeUnit.SECONDS); }
-        catch (Exception e) { log.error("获取锁失败, itemId={}, userId={}", itemId, userId, e); throw new BizException(ErrorCode.BID_LOCK_FAILED); }
-        if (!locked) throw new BizException(ErrorCode.BID_LOCK_FAILED);
-
+        RLock lock = lockAuctionItem(itemId);
         try {
-            boolean delayed = handleDelay(item);
+            AuctionItem item = mustGet(itemId);
+            LocalDateTime now = LocalDateTime.now();
 
+            validateAuctionActive(item);
+            validateAuctionNotExpired(item, now);
+            validateNotCurrentWinner(item, userId);
+            validateIncrement(item.getCurrentPrice(), amount, item.getIncrementAmount());
+            validateMaxPrice(amount, item.getMaxPrice());
+
+            BigDecimal oldPrice = item.getCurrentPrice();
             Long oldBidderId = item.getCurrentBidderId();
-            item.setCurrentPrice(amount);
-            item.setCurrentBidderId(userId);
-            item.setBidCount(item.getBidCount() + 1);
-            auctionItemMapper.updateById(item);
+            LocalDateTime newEndTime = calculateEndTimeAfterBid(item, now);
+            boolean delayed = !Objects.equals(newEndTime, item.getActualEndTime());
 
+            freezeBidFunds(userId, amount);
+            int updated = auctionItemMapper.updateBidIfCurrent(
+                    itemId, oldPrice, amount, userId, newEndTime, now);
+            if (updated != 1) throw new BizException(409, "当前价格已变化，请重新出价");
+
+            if (oldBidderId != null) {
+                releaseFrozenFunds(oldBidderId, oldPrice);
+            }
+
+            bidMapper.invalidateActiveBids(itemId);
             Bid bid = new Bid();
             bid.setItemId(itemId);
             bid.setUserId(userId);
             bid.setBidAmount(amount);
-            bid.setBidTime(java.time.LocalDateTime.now());
+            bid.setBidTime(now);
             bid.setIsValid(1);
             bidMapper.insert(bid);
 
-            // 副作用：更新排行榜
-            try {
-                redissonClient.getScoredSortedSet("auction:" + itemId + ":ranking")
-                        .add(amount.doubleValue(), userId.toString());
-            } catch (Exception e) { log.error("排行榜更新失败, itemId={}", itemId, e); }
+            item.setCurrentPrice(amount);
+            item.setCurrentBidderId(userId);
+            item.setBidCount(item.getBidCount() + 1);
+            item.setActualEndTime(newEndTime);
 
-            try {
-                String bidderNick = getUserNickSafely(userId);
-                broadcaster.broadcastBidUpdate(item.getRoomId(),
-                        new BidUpdateMessage("BID", amount, bidderNick, item.getBidCount(), itemId));
-                if (delayed) broadcastAuctionEventSafely(item, "DELAYED");
-                if (oldBidderId != null && !oldBidderId.equals(userId)) {
-                    broadcaster.sendOutbidNotification(String.valueOf(oldBidderId),
-                            new OutbidMessage("OUTBID", amount, itemId, item.getName()));
-                }
-            } catch (Exception e) { log.error("WS广播失败, itemId={}", itemId, e); }
+            runAfterCommit(() -> afterBidCommitted(item, userId, amount, oldBidderId, delayed));
 
             if (item.getMaxPrice() != null && amount.compareTo(item.getMaxPrice()) >= 0) {
-                log.info("达到封顶价,自动成交,itemId={},amount={},maxPrice={}",itemId,amount,item.getMaxPrice());
+                log.info("达到封顶价，自动成交: itemId={}, amount={}, maxPrice={}", itemId, amount, item.getMaxPrice());
                 doEndAuction(item);
             }
 
             return item;
         } finally {
-            try { lock.unlock(); } catch (Exception ignored) {}
-            cacheService.invalidate("cache:item:" + itemId);
-            cacheService.invalidate("cache:room:" + item.getRoomId() + ":auctions");
+            unlockSafely(lock);
         }
     }
 
@@ -240,30 +259,102 @@ public class AuctionServiceImpl implements AuctionService {
     }
 
     void validateIncrement(BigDecimal currentPrice, BigDecimal bidAmount, BigDecimal increment) {
-        if (bidAmount.compareTo(currentPrice.add(increment)) < 0)
+        if (bidAmount.compareTo(currentPrice.add(increment)) < 0) {
             throw new BizException(ErrorCode.BID_INCREMENT_INVALID.getCode(),
-                    ErrorCode.BID_INCREMENT_INVALID.getMessage() + "（当前价: " + currentPrice + ", 最低出价: " + currentPrice.add(increment) + "）");
+                    ErrorCode.BID_INCREMENT_INVALID.getMessage()
+                            + "（当前价: " + currentPrice + ", 最低出价: " + currentPrice.add(increment) + "）");
+        }
     }
 
     void validateMaxPrice(BigDecimal amount, BigDecimal maxPrice) {
-        if (maxPrice != null && amount.compareTo(maxPrice) > 0)
-            throw new BizException(ErrorCode.BID_TOO_LOW.getCode(), "出价超过封顶价" + maxPrice + "，不可超出");
-    }
-
-    void validateBalance(Long userId, BigDecimal amount) {
-        User user = userMapper.selectById(userId);
-        if (user.getBalance().compareTo(amount) < 0) throw new BizException(ErrorCode.BALANCE_INSUFFICIENT);
+        if (maxPrice != null && amount.compareTo(maxPrice) > 0) {
+            throw new BizException(ErrorCode.BID_TOO_LOW.getCode(), "出价超过封顶价 " + maxPrice + "，不可超出");
+        }
     }
 
     boolean handleDelay(AuctionItem item) {
-        if (item.getActualEndTime() == null) return false;
-        long remainSeconds = java.time.Duration.between(java.time.LocalDateTime.now(), item.getActualEndTime()).getSeconds();
-        if (remainSeconds > 0 && remainSeconds <= item.getDelaySeconds()) {
-            item.setActualEndTime(item.getActualEndTime().plusSeconds(item.getDelaySeconds()));
-            log.info("竞拍延时, itemId={}, 新结束时间={}", item.getId(), item.getActualEndTime());
-            return true;
+        LocalDateTime nextEndTime = calculateEndTimeAfterBid(item, LocalDateTime.now());
+        boolean delayed = !Objects.equals(nextEndTime, item.getActualEndTime());
+        item.setActualEndTime(nextEndTime);
+        return delayed;
+    }
+
+    private void validateAuctionNotExpired(AuctionItem item, LocalDateTime now) {
+        if (item.getActualEndTime() != null && !item.getActualEndTime().isAfter(now)) {
+            throw new BizException(ErrorCode.AUCTION_ALREADY_ENDED);
         }
-        return false;
+    }
+
+    private void validateNotCurrentWinner(AuctionItem item, Long userId) {
+        if (userId.equals(item.getCurrentBidderId())) {
+            throw new BizException(400, "您已是当前最高出价者，无需重复出价");
+        }
+    }
+
+    private LocalDateTime calculateEndTimeAfterBid(AuctionItem item, LocalDateTime now) {
+        if (item.getActualEndTime() == null) return null;
+        long remainSeconds = Duration.between(now, item.getActualEndTime()).getSeconds();
+        if (remainSeconds > 0 && remainSeconds <= item.getDelaySeconds()) {
+            LocalDateTime newEndTime = item.getActualEndTime().plusSeconds(item.getDelaySeconds());
+            log.info("竞拍延时: itemId={}, newEndTime={}", item.getId(), newEndTime);
+            return newEndTime;
+        }
+        return item.getActualEndTime();
+    }
+
+    private void freezeBidFunds(Long userId, BigDecimal amount) {
+        int updated = userMapper.freezeBidFunds(userId, amount);
+        if (updated != 1) throw new BizException(ErrorCode.BALANCE_INSUFFICIENT);
+    }
+
+    private void releaseFrozenFunds(Long userId, BigDecimal amount) {
+        int updated = userMapper.releaseBidFunds(userId, amount);
+        if (updated != 1) throw new BizException(500, "释放冻结资金失败，请稍后重试");
+    }
+
+    private RLock lockAuctionItem(Long itemId) {
+        RLock lock = redissonClient.getLock("lock:bid:" + itemId);
+        boolean locked;
+        try {
+            locked = lock.tryLock(1, 5, TimeUnit.SECONDS);
+        } catch (Exception e) {
+            log.error("获取拍品锁失败: itemId={}", itemId, e);
+            throw new BizException(ErrorCode.BID_LOCK_FAILED);
+        }
+        if (!locked) throw new BizException(ErrorCode.BID_LOCK_FAILED);
+        return lock;
+    }
+
+    private void unlockSafely(RLock lock) {
+        try {
+            if (lock != null && lock.isHeldByCurrentThread()) lock.unlock();
+        } catch (Exception e) {
+            log.warn("释放拍品锁失败", e);
+        }
+    }
+
+    private void afterBidCommitted(AuctionItem item, Long userId, BigDecimal amount, Long oldBidderId, boolean delayed) {
+        try {
+            redissonClient.getScoredSortedSet("auction:" + item.getId() + ":ranking")
+                    .add(amount.doubleValue(), userId.toString());
+        } catch (Exception e) {
+            log.error("排行榜更新失败: itemId={}", item.getId(), e);
+        }
+
+        try {
+            String bidderNick = getUserNickSafely(userId);
+            broadcaster.broadcastBidUpdate(item.getRoomId(),
+                    new BidUpdateMessage("BID", amount, bidderNick, item.getBidCount(), item.getId()));
+            if (delayed) broadcastAuctionEventSafely(item, "DELAYED");
+            if (oldBidderId != null && !oldBidderId.equals(userId)) {
+                broadcaster.sendOutbidNotification(String.valueOf(oldBidderId),
+                        new OutbidMessage("OUTBID", amount, item.getId(), item.getName()));
+            }
+        } catch (Exception e) {
+            log.error("WS 广播失败: itemId={}", item.getId(), e);
+        }
+
+        invalidateAuctionCaches(item);
     }
 
     private String getUserNickSafely(Long userId) {
@@ -282,7 +373,28 @@ public class AuctionServiceImpl implements AuctionService {
                 msg.setFinalPrice(item.getCurrentPrice());
             }
             broadcaster.broadcastAuctionEvent(item.getRoomId(), msg);
-        } catch (Exception e) { log.error("WS事件广播失败, itemId={}, event={}", item.getId(), event, e); }
+        } catch (Exception e) {
+            log.error("WS 事件广播失败: itemId={}, event={}", item.getId(), event, e);
+        }
+    }
+
+    private void invalidateAuctionCaches(AuctionItem item) {
+        cacheService.invalidate("cache:item:" + item.getId());
+        cacheService.invalidate("cache:room:" + item.getRoomId() + ":auctions");
+        cacheService.invalidate("cache:rooms:live");
+    }
+
+    private void runAfterCommit(Runnable action) {
+        if (!TransactionSynchronizationManager.isSynchronizationActive()) {
+            action.run();
+            return;
+        }
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+            @Override
+            public void afterCommit() {
+                action.run();
+            }
+        });
     }
 
     private String toJsonArray(String images) {

@@ -26,4 +26,5 @@ public class User {
     private String avatar;
     private Integer role;
     private BigDecimal balance;
+    private BigDecimal frozenBalance;
 }

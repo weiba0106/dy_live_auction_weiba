@@ -16,7 +16,8 @@ CREATE TABLE IF NOT EXISTS users (
     nickname        VARCHAR(50)      NOT NULL,
     avatar          VARCHAR(500)     DEFAULT '',
     role            TINYINT          NOT NULL DEFAULT 2 COMMENT '1:主播/商家, 2:普通用户',
-    balance         DECIMAL(12,2)    NOT NULL DEFAULT 0.00 COMMENT '账户余额(模拟)',
+    balance         DECIMAL(12,2)    NOT NULL DEFAULT 0.00 COMMENT '账户可用余额(模拟)',
+    frozen_balance  DECIMAL(12,2)    NOT NULL DEFAULT 0.00 COMMENT '竞拍冻结金额',
     created_at      DATETIME         NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at      DATETIME         NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='用户表';
@@ -70,7 +71,8 @@ CREATE TABLE IF NOT EXISTS auction_items (
     INDEX idx_room (room_id),
     INDEX idx_merchant (merchant_id),
     INDEX idx_status (status),
-    INDEX idx_room_status (room_id, status)
+    INDEX idx_room_status (room_id, status),
+    INDEX idx_status_end_time (status, actual_end_time)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='竞拍商品表(含规则)';
 
 -- ============================================================
@@ -112,6 +114,7 @@ CREATE TABLE IF NOT EXISTS orders (
     FOREIGN KEY (seller_id) REFERENCES users(id),
     INDEX idx_buyer (buyer_id),
     INDEX idx_seller (seller_id),
+    UNIQUE KEY uk_item (item_id),
     INDEX idx_item (item_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='订单表';
 
