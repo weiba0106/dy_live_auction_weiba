@@ -16,6 +16,8 @@ import com.dy.liveauction.dao.mapper.UserMapper;
 import com.dy.liveauction.service.auction.AuctionService;
 import com.dy.liveauction.service.auction.dto.AuctionCreateRequest;
 import com.dy.liveauction.service.auction.dto.AuctionDetailVO;
+import com.dy.liveauction.service.auction.redis.RedisBidAdjudicationResult;
+import com.dy.liveauction.service.auction.redis.RedisBidAdjudicator;
 import com.dy.liveauction.service.auction.state.AuctionStateMachine;
 import com.dy.liveauction.service.auction.ws.AuctionWsBroadcaster;
 import com.dy.liveauction.service.auction.ws.dto.AuctionEventMessage;
@@ -53,6 +55,7 @@ public class AuctionServiceImpl implements AuctionService {
     private final AuctionWsBroadcaster broadcaster;
     private final RedissonClient redissonClient;
     private final CacheService cacheService;
+    private final RedisBidAdjudicator redisBidAdjudicator;
     private final AuctionStateMachine stateMachine = new AuctionStateMachine();
     private final ApplicationEventPublisher eventPublisher;
 
@@ -139,6 +142,7 @@ public class AuctionServiceImpl implements AuctionService {
 
         runAfterCommit(() -> {
             invalidateAuctionCaches(item);
+            redisBidAdjudicator.initializeAuction(item);
             eventPublisher.publishEvent(new AuctionStatusChangeEvent(this, item.getId(), oldStatus, item.getStatus(), null));
             broadcastAuctionEventSafely(item, "STARTED");
         });
@@ -162,6 +166,7 @@ public class AuctionServiceImpl implements AuctionService {
 
             runAfterCommit(() -> {
                 invalidateAuctionCaches(item);
+                redisBidAdjudicator.markClosed(item.getId(), 5);
                 eventPublisher.publishEvent(new AuctionStatusChangeEvent(this, item.getId(), oldStatus, 5, null));
                 broadcastAuctionEventSafely(item, "CANCELLED");
             });
@@ -192,6 +197,7 @@ public class AuctionServiceImpl implements AuctionService {
 
         runAfterCommit(() -> {
             invalidateAuctionCaches(item);
+            redisBidAdjudicator.markClosed(item.getId(), item.getStatus());
             eventPublisher.publishEvent(new AuctionStatusChangeEvent(
                     this, item.getId(), oldStatus, item.getStatus(), item.getWinnerId()));
             broadcastAuctionEventSafely(item, item.getStatus() == 4 ? "SOLD" : "ENDED");
@@ -202,6 +208,70 @@ public class AuctionServiceImpl implements AuctionService {
     @Override
     @Transactional
     public AuctionItem placeBid(Long itemId, Long userId, BigDecimal amount) {
+        if (redisBidAdjudicator.isEnabled()) {
+            return placeBidWithRedisLua(itemId, userId, amount);
+        }
+        return placeBidWithDatabase(itemId, userId, amount);
+    }
+
+    private AuctionItem placeBidWithRedisLua(Long itemId, Long userId, BigDecimal amount) {
+        AuctionItem item = mustGet(itemId);
+        LocalDateTime now = LocalDateTime.now();
+
+        validateMaxPrice(amount, item.getMaxPrice());
+        freezeBidFunds(userId, amount);
+
+        RedisBidAdjudicationResult result;
+        try {
+            result = redisBidAdjudicator.adjudicate(item, userId, amount, now);
+        } catch (BizException e) {
+            throw e;
+        } catch (Exception e) {
+            log.error("Redis Lua 出价裁决失败: itemId={}, userId={}, amount={}", itemId, userId, amount, e);
+            throw new BizException(ErrorCode.BID_LOCK_FAILED);
+        }
+
+        if (result.getOldBidderId() != null) {
+            releaseFrozenFunds(result.getOldBidderId(), result.getOldPrice());
+        }
+
+        boolean latest = redisBidAdjudicator.isCurrentVersion(itemId, result.getVersion());
+        if (latest) {
+            bidMapper.invalidateActiveBids(itemId);
+        }
+
+        Bid bid = new Bid();
+        bid.setItemId(itemId);
+        bid.setUserId(userId);
+        bid.setBidAmount(amount);
+        bid.setBidTime(now);
+        bid.setIsValid(latest ? 1 : 0);
+        bidMapper.insert(bid);
+
+        auctionItemMapper.updateBidSnapshotIfHigher(
+                itemId,
+                amount,
+                userId,
+                result.getBidCount(),
+                result.getActualEndTime());
+
+        item.setCurrentPrice(amount);
+        item.setCurrentBidderId(userId);
+        item.setBidCount(result.getBidCount());
+        item.setActualEndTime(result.getActualEndTime());
+
+        runAfterCommit(() -> afterBidCommitted(
+                item, userId, amount, result.getOldBidderId(), result.isDelayed()));
+
+        if (result.isSold()) {
+            log.info("Redis Lua 达到封顶价，自动成交: itemId={}, amount={}", itemId, amount);
+            doEndAuction(item);
+        }
+
+        return item;
+    }
+
+    private AuctionItem placeBidWithDatabase(Long itemId, Long userId, BigDecimal amount) {
         RLock lock = lockAuctionItem(itemId);
         try {
             AuctionItem item = mustGet(itemId);

@@ -55,6 +55,22 @@ public interface AuctionItemMapper extends BaseMapper<AuctionItem> {
 
     @Update("""
             UPDATE auction_items
+            SET current_price = #{newPrice},
+                current_bidder_id = #{userId},
+                bid_count = GREATEST(bid_count, #{bidCount}),
+                actual_end_time = #{actualEndTime}
+            WHERE id = #{itemId}
+              AND status = 2
+              AND current_price < #{newPrice}
+            """)
+    int updateBidSnapshotIfHigher(@Param("itemId") Long itemId,
+                                  @Param("newPrice") BigDecimal newPrice,
+                                  @Param("userId") Long userId,
+                                  @Param("bidCount") Integer bidCount,
+                                  @Param("actualEndTime") LocalDateTime actualEndTime);
+
+    @Update("""
+            UPDATE auction_items
             SET status = #{newStatus},
                 winner_id = #{winnerId}
             WHERE id = #{itemId}
